@@ -1,0 +1,191 @@
+
+library(caret)  
+library(stats)  
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(car)
+library(MASS)
+library("lmtest")
+library("tseries")
+# Load data
+df_2k <- nba2k20.full
+
+# Convert height from feet-inches to meters
+convert_height <- function(height) {
+  parts <- strsplit(height, "/")[[1]]
+  if (length(parts) >= 2) {
+    feet_inches <- strsplit(parts[1], "-")[[1]]
+    total_inches <- as.numeric(feet_inches[1]) * 12 + as.numeric(feet_inches[2])
+    return(round(total_inches * 0.0254, 2))
+  }
+}
+
+# Convert weight from pounds to kilograms
+convert_weight <- function(weight) {
+  parts <- strsplit(weight, "/")[[1]]
+  if (length(parts) >= 2) {
+    pounds <- as.numeric(strsplit(parts[1], " ")[[1]][1])
+    kilograms <- pounds * 0.45359237
+    return(round(kilograms, 2))
+  }
+}
+
+# Calculate age from birthdate
+from_date_to_age <- function(b_day) {
+  birth_date <- mdy(b_day)
+  return(age(birth_date))
+}
+
+#Calculate age
+calculate_age <- function(b_day) {
+    # Convert birthdate from string to Date object
+    b_day <- as.Date(b_day, format = "%m/%d/%y")
+
+    # Get the current date
+    current_date <- Sys.Date()
+
+    # Calculate difference in years
+    age <- as.integer(format(current_date, "%Y")) - as.integer(format(b_day, "%Y"))
+
+    # Adjust for birthdays that haven't occurred yet this year
+    if (as.Date(paste(format(current_date, "%Y"), format(b_day, "-%m-%d"), sep="")) > current_date) {
+        age <- age - 1
+    }
+
+    return(age)
+}
+
+
+# Apply the conversion functions
+df_2k$height_in_m <- sapply(df_2k$height, convert_height)
+df_2k$weight_in_kg <- sapply(df_2k$weight, convert_weight)
+
+# Remove dollar sign and convert salary to integer
+df_2k$salary <- as.numeric(gsub("\\$", "", df_2k$salary))
+
+# Calculate current age and years played
+df_2k$current_age <- sapply(df_2k$b_day, calculate_age)
+df_2k$years_played <- 2023 - df_2k$draft_year
+
+# Replace "Undrafted" with 0
+df_2k$draft_round[df_2k$draft_round == "Undrafted"] <- 0
+df_2k$draft_peak[df_2k$draft_peak == "Undrafted"] <- 0
+
+# Drop unnecessary columns
+df_2k <- df_2k %>% select(-c(b_day, college))
+
+# Calculate BMI
+df_2k$body_mass_index <- df_2k$weight_in_kg / (df_2k$height_in_m / 100) ^ 2
+
+# Categorize BMI
+df_2k$bmi_class <- cut(df_2k$body_mass_index, breaks = c(0, 18.5, 24.9, 29.9, Inf), 
+                       labels = c("Underweight", "Normal", "Overweight", "Obese"), right = FALSE)
+
+# Remove duplicates
+df_2k_unique <- df_2k %>% distinct(full_name, .keep_all = TRUE)
+
+# OLS Regression
+fit <- lm(salary ~ rating + current_age + years_played, data = df_2k_unique)
+summary(fit)
+
+# Residual Plot
+ggplot(data = df_2k_unique, aes(x = fit$fitted.values, y = fit$residuals)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") + 
+  ggtitle("Residual Plot") + 
+  xlab("Predicted Values") + 
+  ylab("Residuals")
+
+# Homoscedasticity Test
+
+# Logarithmic Transformation
+df_2k_unique$salary_log <- log(df_2k_unique$salary + 1)  # Avoid log(0)
+
+# Linear Regression Model
+df_2k_unique <- na.omit(df_2k_unique)  # Remove NA values if necessary
+model_transformed <- lm(salary_log ~ rating + current_age + years_played, data = df_2k_unique)
+
+# Residuals of the Transformed Model and Filtering
+residuals_transformed <- residuals(model_transformed)
+filtered_df <- subset(df_2k_unique, residuals_transformed > -1.5 & residuals_transformed < 1.5)
+
+# Re-fit the Regression Model with Filtered Data
+model_filtered <- lm(salary_log ~ rating + current_age + years_played, data = filtered_df)
+
+# Residuals of the Filtered Model
+residuals_filtered <- residuals(model_filtered)
+
+# Breusch-Pagan Test on the Filtered Model
+bp_test_filtered <- bptest(model_filtered)
+
+# Plotting the Residuals of the Filtered Model
+ggplot(filtered_df, aes(x = predict(model_filtered), y = residuals_filtered)) +
+    geom_point() +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    ggtitle("Residual Plot of Filtered Model") +
+    xlab("Predicted Values (Log of Salary)") +
+    ylab("Residuals")
+
+# Print the Breusch-Pagan Test Results of the Filtered Model
+print(bp_test_filtered)
+
+
+# QQ Plot
+qqnorm(fit$residuals)
+qqline(fit$residuals)
+
+# VIF Calculation
+vif(fit)
+
+# Jarque-Bera Test
+jarque.bera.test(fit$residuals)
+
+# Durbin-Watson Test
+durbinWatsonTest(fit)
+
+
+#Backtest
+
+# Calculating Q1, Q3, and IQR
+Q1 <- quantile(df_2k_unique$salary_log, 0.25)
+Q3 <- quantile(df_2k_unique$salary_log, 0.75)
+IQR <- Q3 - Q1
+
+# Defining the range for outliers
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+# Filtering out outliers
+df_filtered <- subset(df_2k_unique, salary_log >= lower_bound & salary_log <= upper_bound)
+
+# Prepare the independent and dependent variables
+X <- df_filtered[, c('rating', 'current_age', 'years_played')]
+y <- df_filtered$salary_log
+
+# Splitting the data into training and testing sets (80% train, 20% test)
+set.seed(0)  # For reproducibility
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X[train_index, ]
+y_train <- y[train_index]
+X_test <- X[-train_index, ]
+y_test <- y[-train_index]
+
+# Fitting the model on the training data
+model_train <- lm(y_train ~ ., data = as.data.frame(cbind(X_train, y_train)))
+
+# Predicting on the test data
+y_pred <- predict(model_train, newdata = as.data.frame(X_test))
+
+# Calculating Mean Squared Error (MSE)
+mse <- mean((y_test - y_pred)^2)
+
+print(paste("Mean Squared Error:", mse))
+
+# Plotting the actual vs. predicted values for the test set
+plot(y_test, y_pred, main = "Actual vs. Predicted Values",
+     xlab = "Actual Values", ylab = "Predicted Values")
+abline(a = 0, b = 1, col = "red", lty = 2)  
+
+
